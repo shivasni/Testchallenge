@@ -1,0 +1,73 @@
+
+
+trigger: none
+
+variables:
+  buildPlatform: 'any cpu'
+  depenv: 'build'
+ 
+  azuredevopsrestapisc: "" 
+  
+
+
+stages:
+- stage: prepare_the_build
+  jobs:
+  - deployment: createbuild
+    displayName: prepare the build files
+    pool:
+      vmImage: 'windows-2019'
+   
+    environment:  $(depenv)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self  
+           
+         
+          - task: PowerShell@2
+            displayName: "git checkout $(SourceBranchName)"
+            inputs:
+              targetType: 'inline'
+              script: "git pull ; git checkout $(SourceBranchName)"
+          
+          - task: ArchiveFiles@2
+            displayName: 'Archive the build files'
+            inputs:
+               rootFolderOrFile: '$(System.DefaultWorkingDirectory)/build/infrastructure/'
+               archiveFile: '$(build.ArtifactStagingDirectory)/$(build.buildId).zip'
+
+          - task: PublishbuildArtifacts@1
+            displayName: 'Publish Artifacts: test_drop_terraform'
+            inputs:
+              pathtoPublish: '$(build.ArtifactStagingDirectory)/$(build.buildId).zip'
+              artifactName: test_drop_terraform
+
+  - deployment: triggernewinfrastructurerelease
+    dependsOn: createbuild
+    displayName: "Trigger a new Infrastructure Release"
+    pool: server
+      # creates an environment if it doesn't exist
+    environment:  build
+    strategy:
+        runOnce:
+          deploy:
+            steps:
+            - task: InvokeRESTAPI@1
+              inputs:
+                connectionType: 'connectedServiceName'
+                serviceConnection: '$(azuredevopsrestapisc)'
+                method: 'POST'
+                body: |
+                  {
+                    
+                      "sourceBranch" : "refs/heads/$(sourceBranchName)",                   
+                      "definition" : {  
+                        "id" : $(definitionid)
+                      },
+                        "parameters" : "{\"tf_buildpipelinename\":\"$(Build.DefinitionName)\",\"tf_buildversion\":\"$(build.buildId)\",\"tf_deploy\":\"true\",\"arm_deploy\":\"false\",\"pipelinesourcebranch\":\"$(build.SourceBranchName)\",\"prod\":\"$(prod)\"}"
+                  }
+                urlSuffix: ''
+                waitForCompletion: 'false'
+                #successCriteria: '{"status" : "notStarted"}'

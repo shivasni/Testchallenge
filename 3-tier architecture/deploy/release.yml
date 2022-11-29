@@ -1,0 +1,249 @@
+
+variables:
+
+  prod_az_svccxn               : ''
+
+  pretest-terraformversion     :  
+  terraformversion             :  
+
+  terraformstatestorageaccountname : ''
+  SoftyStorageRSC                  : ''
+  terraformstatestorageaccountkey  : ''
+  WorkflowSubscriptionId            : ''
+  WorkflowResourceGroup             : ''
+  location                          : ''
+  applicationcode                  : ''  
+  terraformPath                    : ''
+  TerraformConfigPath              : ''
+  TerraformConfigFile              : ''
+  
+ 
+stages:
+- stage : init_deployment
+  condition: |
+    or
+    (
+      
+      eq(variables['prod'], 1)
+    )
+    
+  pool : 
+    vmImage: 'windows-2019'
+  jobs:
+  - deployment : Init_Deployment 
+    environment:  'prepare'
+    strategy:
+      runOnce:
+        deploy:
+          steps :
+            - checkout : self 
+              displayName: 'Initialise Pipeline Artifacts'
+
+            - task: DownloadbuildArtifacts@0
+              condition: eq(variables['tf_deploy'], true)
+              displayName: 'Download Terraform build Artifacts'
+              inputs:
+                    buildType: 'specific'
+                    project: ''
+                    pipeline: '$(tf_buildpipelinename)'
+                    buildVersionToDownload: 'Specific'
+                    branchName: 'refs/heads/$(pipelinesourcebranch)'
+                    buildId: '$(tf_buildversion)'
+                    downloadType: 'single'
+                    artifactName: '$(applicationcode)_drop_terraform'
+                    downloadPath: '$(buildArtifactFolder)'
+
+            - task: ExtractFiles@1
+              condition: eq(variables['tf_deploy'], true)
+              displayName: 'Extract files Terraform Deploy'
+              inputs:
+                archiveFilePatterns: '$(buildArtifactFolder)\$(applicationcode)_drop_terraform\*.zip  '
+                destinationFolder: '$(TerraformPipelineArtifactSrc)'
+            
+            - task : PublishPipelineArtifact@1
+              condition: eq(variables['tf_deploy'], true)
+              displayName: 'Publish Terraform Pipelines Artifacts'
+              inputs:
+                targetPath: '$(TerraformPipelineArtifactSrc)'
+                artifact: '$(applicationcode)_drop_terraform'
+
+          
+            
+           
+
+
+- stage : prod_prepare
+  dependsOn:
+  - init_deployment
+  
+  
+  variables: 
+      env               : 'prod'   
+     
+
+  pool : 
+    vmImage: 'windows-2019'
+
+  jobs:
+  - deployment : Download_and_Publish_Pipeline_Artifacts
+    condition: and(succeeded(), variables['tf_deploy'])
+    environment:  'prepare'
+    strategy:
+      runOnce:
+        deploy:
+          steps: 
+                - checkout: none 
+                  clean: true
+                - task: DownloadPipelineArtifact@2
+                  condition: eq(variables['tf_deploy'], true)
+                  displayName: 'Download terraform Code from Pipeline Artifact'
+                  inputs:
+                    artifact: '$(applicationcode)_drop_terraform'
+                    path: '$(PipelineArtifactTerraform)'
+                
+                - task: DownloadPipelineArtifact@2
+                  condition: eq(variables['arm_deploy'], true)
+                  displayName: 'Download ARM Code from Pipeline Artifact'
+                  inputs:
+                    artifact: '$(applicationcode)_drop_ARMTemplate'
+                    path: '$(PipelineArtifactARM)'
+
+                - task:  11645770-d18e-11e8-8f5b-1b8b62612b3b@0
+                  condition: eq(variables['tf_deploy'], true)
+                  displayName:  'Install terraform'
+                  inputs:
+                    terraformVersion: $(terraformversion)
+
+                - task: qetza.replacetokens.replacetokens-task.replacetokens@3
+                  condition: eq(variables['tf_deploy'], true)
+                  enabled: false
+                  displayName: 'Replace tokens in tfparams.tfvars '
+                  inputs:
+                    rootDirectory: '$(TerraformConfigPath)'
+                    targetFiles: tfparams.tfvars
+                    escapeType: none
+
+                
+          
+                - task: AzurePowerShell@4
+                  condition: eq(variables['tf_deploy'], true)
+                  enabled: true
+                  displayName: "Retrieve the Terraform State Storage Account Key"
+                  inputs:
+                    azureSubscription: '$(prod_az_svccxn)'
+                    ScriptType: 'InlineScript'
+                    Inline: |  
+                      $sa = Get-AzStorageAccountKey -StorageAccountName $(terraformstatestorageaccountname) -ResourceGroupName $(SoftyStorageRSC)
+                      $key1 = $sa.Value[0]
+                      Write-Host "##vso[task.setvariable variable=terraformstatestorageaccountkey;]$key1"
+                    azurePowerShellVersion: 'LatestVersion'
+
+                              
+                - task: TerraformCLI@0
+                  condition: eq(variables['tf_deploy'], true)
+                  displayName: 'Terraform Init'
+                  enabled: true
+                  inputs:
+                    command: 'init'
+                    commandOptions: '-backend-config="storage_account_name=$(terraformstatestorageaccountname)" -backend-config="container_name=$(applicationcode)" -backend-config="access_key="$(terraformstatestorageaccountkey)"" -backend-config="key=prod.tfstate"'
+                    workingDirectory: '$(terraformPath)'
+
+         
+                - task: TerraformTaskV1@0
+                  condition: eq(variables['tf_deploy'], true)
+                  displayName:  'Terraform Plan'
+                  inputs:
+                    provider: 'azurerm'
+                    command: 'plan'
+                    workingDirectory: '$(terraformPath)'
+                    commandOptions: '-var-file="$(TerraformConfigFile)"  -out $(SrctfPlanFile) -lock=false -input=false'
+                    environmentServiceNameAzureRM: '$(prod_az_svccxn)'
+                  
+                - task: PublishPipelineArtifact@1
+                  condition: eq(variables['tf_deploy'], true)
+                  #enabled:  false
+                  displayName: 'Publish Artifact: prod-terraform-plan'
+                  inputs:
+                    targetPath: '$(TFPlanPipelineArtifactSrc)'
+                    artifact: prod-terraform-plan
+
+- stage : prod_Terraform_Deployment
+  
+  dependsOn:
+  - init_deployment
+  - prod_prepare
+  condition: |
+   and
+    (
+    eq(variables['tf_deploy'], true),
+    in(dependencies.prod_prepare.result,'Succeeded','SucceededWithIssues')
+    )
+  pool:
+      vmImage: 'windows-2019'
+  
+  variables: 
+      env                   : 'prod'
+     
+
+
+  jobs:
+    - deployment : deploy_Terraform
+      environment:  'prod'
+      strategy:
+        runOnce:
+          deploy:
+            steps: 
+                  - checkout: none 
+                    clean: true
+
+                  - task: DownloadPipelineArtifact@2
+                    displayName: 'Download terraform plan artifact'
+                    inputs:
+                      artifactName: 'prod-terraform-plan'
+                      targetPath: '$(PipelineArtifactTFPlan)'
+                  - task: DownloadPipelineArtifact@2
+                    displayName: 'Download terraform Code from Pipeline Artifact'
+                    inputs:
+                      artifact: '$(applicationcode)_drop_terraform'
+                      path: '$(PipelineArtifactTerraform)'
+
+                      
+                  - task:  11645770-d18e-11e8-8f5b-1b8b62612b3b@0
+                    displayName:  'Install Terraform'
+                    inputs:
+                      terraformVersion: $(terraformversion)
+             
+
+                  - task: AzurePowerShell@4
+                    condition: eq(variables['tf_deploy'], true)
+                    enabled: true
+                    displayName: "Retrieve the Terraform State Storage Account Key"
+                    inputs:
+                      azureSubscription: '$(prod_az_svccxn)'
+                      ScriptType: 'InlineScript'
+                      Inline: |  
+                        $sa = Get-AzStorageAccountKey -StorageAccountName $(terraformstatestorageaccountname) -ResourceGroupName $(SoftyStorageRSC)
+                        $key1 = $sa.Value[0]
+                        Write-Host "##vso[task.setvariable variable=terraformstatestorageaccountkey;]$key1"
+                      azurePowerShellVersion: 'LatestVersion'
+
+                                
+                  - task: TerraformCLI@0
+                    condition: eq(variables['tf_deploy'], true)
+                    displayName: 'Terraform Init'
+                    enabled: true
+                    inputs:
+                      command: 'init'
+                      commandOptions: '-backend-config="storage_account_name=$(terraformstatestorageaccountname)" -backend-config="container_name=$(applicationcode)" -backend-config="access_key="$(terraformstatestorageaccountkey)"" -backend-config="key=prod02.tfstate"'
+                      workingDirectory: '$(terraformPath)'
+                                
+                  - task: TerraformTaskV1@0
+                    enabled: true
+                    displayName: "Terraform Apply"
+                    inputs:
+                      provider: 'azurerm'
+                      command: 'apply'
+                      workingDirectory: '$(terraformPath)'
+                      commandOptions: '-auto-approve 
+                      environmentServiceNameAzureRM: '$(prod_az_svccxn)'
+
